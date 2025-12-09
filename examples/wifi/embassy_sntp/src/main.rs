@@ -257,6 +257,9 @@ async fn connection(mut controller: WifiController<'static>) {
 
     let _ = CONNECTION_CHANNEL.receive().await;
 
+    controller.disconnect_async().await.unwrap();
+    controller.stop_async().await.unwrap();
+
     println!("connection task end");
 }
 
