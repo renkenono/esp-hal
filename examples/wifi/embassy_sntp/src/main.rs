@@ -15,10 +15,12 @@ use core::net::{IpAddr, SocketAddr};
 use embassy_executor::Spawner;
 use embassy_net::{
     Runner,
+    Stack,
     StackResources,
     dns::DnsQueryType,
     udp::{PacketMetadata, UdpSocket},
 };
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
@@ -28,15 +30,7 @@ use esp_hal::{clock::CpuClock, rng::Rng, rtc_cntl::Rtc, timer::timg::TimerGroup}
 use esp_println::println;
 use esp_radio::{
     Controller,
-    wifi::{
-        ClientConfig,
-        ModeConfig,
-        ScanConfig,
-        WifiController,
-        WifiDevice,
-        WifiEvent,
-        WifiStaState,
-    },
+    wifi::{ClientConfig, ModeConfig, ScanConfig, WifiController, WifiDevice},
 };
 use log::{error, info};
 use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
@@ -60,6 +54,11 @@ const NTP_SERVER: &str = "pool.ntp.org";
 
 /// Microseconds in a second
 const USEC_IN_SEC: u64 = 1_000_000;
+
+static SNTP_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static SNTP_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static CONNECTION_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static CONNECTION_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 
 #[derive(Clone, Copy)]
 struct Timestamp<'a> {
@@ -119,28 +118,39 @@ async fn main(spawner: Spawner) -> ! {
         seed,
     );
 
-    spawner.spawn(connection(controller)).ok();
-    spawner.spawn(net_task(runner)).ok();
+    spawner.must_spawn(sntp(stack, rtc));
+    spawner.must_spawn(connection(controller));
+    spawner.must_spawn(net_task(runner));
 
+    let _ = CONNECTION_EVENT_CHANNEL.receive().await;
+    println!("connection is up");
+    Timer::after_secs(5).await;
+
+    SNTP_CHANNEL.send(()).await;
+    let _ = SNTP_EVENT_CHANNEL.receive().await;
+    println!("sntp task done");
+
+    CONNECTION_CHANNEL.send(()).await;
+    println!("shutting down wifi subsystem");
+
+    // Busy working...
+    Timer::after_secs(600).await;
+    loop {}
+}
+
+#[embassy_executor::task]
+async fn sntp(stack: Stack<'static>, rtc: Rtc<'static>) {
     let mut rx_meta = [PacketMetadata::EMPTY; 16];
     let mut rx_buffer = [0; 4096];
     let mut tx_meta = [PacketMetadata::EMPTY; 16];
     let mut tx_buffer = [0; 4096];
 
-    loop {
-        if stack.is_link_up() {
-            break;
-        }
-        Timer::after(Duration::from_millis(500)).await;
-    }
-
+    stack.wait_link_up().await;
     println!("Waiting to get IP address...");
-    loop {
-        if let Some(config) = stack.config_v4() {
-            println!("Got IP: {}", config.address);
-            break;
-        }
-        Timer::after(Duration::from_millis(500)).await;
+
+    stack.wait_config_up().await;
+    if let Some(config) = stack.config_v4() {
+        println!("Got IP: {}", config.address);
     }
 
     let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
@@ -163,94 +173,91 @@ async fn main(spawner: Spawner) -> ! {
     let now = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
     info!("Rtc: {now}");
 
-    loop {
-        let addr: IpAddr = ntp_addrs[0].into();
-        let result = get_time(
-            SocketAddr::from((addr, 123)),
-            &socket,
-            NtpContext::new(Timestamp {
-                rtc: &rtc,
-                current_time_us: 0,
-            }),
-        )
-        .await;
+    let addr: IpAddr = ntp_addrs[0].into();
+    let result = get_time(
+        SocketAddr::from((addr, 123)),
+        &socket,
+        NtpContext::new(Timestamp {
+            rtc: &rtc,
+            current_time_us: 0,
+        }),
+    )
+    .await;
 
-        match result {
-            Ok(time) => {
-                // Set time immediately after receiving to reduce time offset.
-                rtc.set_current_time_us(
-                    (time.sec() as u64 * USEC_IN_SEC)
-                        + ((time.sec_fraction() as u64 * USEC_IN_SEC) >> 32),
-                );
+    match result {
+        Ok(time) => {
+            // Set time immediately after receiving to reduce time offset.
+            rtc.set_current_time_us(
+                (time.sec() as u64 * USEC_IN_SEC)
+                    + ((time.sec_fraction() as u64 * USEC_IN_SEC) >> 32),
+            );
 
-                // Compare RTC to parsed time
-                info!(
-                    "Response: {:?}\nTime: {}\nRtc : {}",
-                    time,
-                    // Create a Jiff Timestamp from seconds and nanoseconds
-                    jiff::Timestamp::from_second(time.sec() as i64)
-                        .unwrap()
-                        .checked_add(
-                            jiff::Span::new()
-                                .nanoseconds((time.seconds_fraction as i64 * 1_000_000_000) >> 32),
-                        )
-                        .unwrap()
-                        .to_zoned(TIMEZONE),
-                    jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64)
-                        .unwrap()
-                        .to_zoned(TIMEZONE)
-                );
-            }
-            Err(e) => {
-                error!("Error getting time: {e:?}");
-            }
+            // Compare RTC to parsed time
+            info!(
+                "Response: {:?}\nTime: {}\nRtc : {}",
+                time,
+                // Create a Jiff Timestamp from seconds and nanoseconds
+                jiff::Timestamp::from_second(time.sec() as i64)
+                    .unwrap()
+                    .checked_add(
+                        jiff::Span::new()
+                            .nanoseconds((time.seconds_fraction as i64 * 1_000_000_000) >> 32),
+                    )
+                    .unwrap()
+                    .to_zoned(TIMEZONE),
+                jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64)
+                    .unwrap()
+                    .to_zoned(TIMEZONE)
+            );
         }
-
-        Timer::after(Duration::from_secs(10)).await;
+        Err(e) => {
+            error!("Error getting time: {e:?}");
+        }
     }
+
+    Timer::after(Duration::from_secs(1)).await;
+    SNTP_EVENT_CHANNEL.send(()).await;
 }
 
 #[embassy_executor::task]
 async fn connection(mut controller: WifiController<'static>) {
-    println!("start connection task");
+    println!("start connection task: {} - {}", SSID, PASSWORD);
     println!("Device capabilities: {:?}", controller.capabilities());
-    loop {
-        if esp_radio::wifi::sta_state() == WifiStaState::Connected {
-            // wait until we're no longer connected
-            controller.wait_for_event(WifiEvent::StaDisconnected).await;
+    let client_config = ModeConfig::Client(
+        ClientConfig::default()
+            .with_ssid(SSID.into())
+            .with_password(PASSWORD.into()),
+    );
+    controller.set_config(&client_config).unwrap();
+    println!("Starting wifi");
+    controller.start_async().await.unwrap();
+    println!("Wifi started!");
+
+    println!("Scan");
+    let scan_config = ScanConfig::default().with_max(10).with_ssid(SSID);
+    let result = controller
+        .scan_with_config_async(scan_config)
+        .await
+        .unwrap();
+    for ap in result {
+        println!("{:?}", ap);
+    }
+
+    println!("About to connect...");
+
+    match controller.connect_async().await {
+        Ok(_) => println!("Wifi connected!"),
+        Err(e) => {
+            println!("Failed to connect to wifi: {e:?}");
             Timer::after(Duration::from_millis(5000)).await
         }
-        if !matches!(controller.is_started(), Ok(true)) {
-            let client_config = ModeConfig::Client(
-                ClientConfig::default()
-                    .with_ssid(SSID.into())
-                    .with_password(PASSWORD.into()),
-            );
-            controller.set_config(&client_config).unwrap();
-            println!("Starting wifi");
-            controller.start_async().await.unwrap();
-            println!("Wifi started!");
-
-            println!("Scan");
-            let scan_config = ScanConfig::default().with_max(10);
-            let result = controller
-                .scan_with_config_async(scan_config)
-                .await
-                .unwrap();
-            for ap in result {
-                println!("{:?}", ap);
-            }
-        }
-        println!("About to connect...");
-
-        match controller.connect_async().await {
-            Ok(_) => println!("Wifi connected!"),
-            Err(e) => {
-                println!("Failed to connect to wifi: {e:?}");
-                Timer::after(Duration::from_millis(5000)).await
-            }
-        }
     }
+
+    CONNECTION_EVENT_CHANNEL.send(()).await;
+
+    let _ = CONNECTION_CHANNEL.receive().await;
+
+    println!("connection task end");
 }
 
 #[embassy_executor::task]
