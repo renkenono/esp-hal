@@ -30,12 +30,10 @@ impl WakeSource for TimerWakeupSource {
     ) {
         triggers.set_timer(true);
 
-        let lp_timer = unsafe { &*esp32c6::LP_TIMER::ptr() };
-        let clock_freq = RtcClock::slow_freq();
-        // TODO: maybe add sleep time adjustment like idf
         // TODO: maybe add check to prevent overflow?
-        let clock_hz = clock_freq.frequency().as_hz() as u64;
-        let ticks = self.duration.as_micros() as u64 * clock_hz / 1_000_000u64;
+        let lp_timer = unsafe { &*esp32c6::LP_TIMER::ptr() };
+        let cal_period = unsafe { lp_aon().store1().read().data().bits() } as u64;
+        let ticks = ((self.duration.as_micros() as u64) << 19) / cal_period;
         // "alarm" time in slow rtc ticks
         let now = rtc.time_since_boot_raw();
         let time_in_ticks = now + ticks;
