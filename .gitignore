@@ -29,3 +29,15 @@ release_plan.jsonc
 
 # Ignore the generated semver baselines
 api-baseline/
+
+.mcp.json
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
