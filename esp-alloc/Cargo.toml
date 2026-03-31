@@ -78,6 +78,10 @@ compat = []
 ## Enable the `#[global_allocator]` attribute for `EspHeap`.
 global-allocator = []
 
+## Emit a compact binary allocation record over `defmt` on every `alloc`/`dealloc`.
+## Requires the `defmt` feature.
+tracking = ["defmt"]
+
 #! ### Chip selection
 #! One of the following features must be enabled to select the target chip:
 

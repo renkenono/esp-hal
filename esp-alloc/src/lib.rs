@@ -147,6 +147,8 @@ mod heap;
 mod macros;
 #[cfg(feature = "compat")]
 mod malloc;
+#[cfg(feature = "tracking")]
+mod tracking;
 
 use core::{
     alloc::{GlobalAlloc, Layout},
@@ -647,10 +649,16 @@ impl EspHeap {
 
 unsafe impl GlobalAlloc for EspHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { self.alloc_caps(EnumSet::empty(), layout) }
+        let ptr = unsafe { self.alloc_caps(EnumSet::empty(), layout) };
+        #[cfg(feature = "tracking")]
+        tracking::track_alloc(ptr, layout.size());
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        #[cfg(feature = "tracking")]
+        tracking::track_dealloc(ptr, layout.size());
+
         let Some(ptr) = NonNull::new(ptr) else {
             return;
         };
